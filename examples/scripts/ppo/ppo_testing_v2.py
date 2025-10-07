@@ -69,20 +69,21 @@ python examples/scripts/ppo/ppo_testing_v2.py \
     --eval_strategy steps \
     --eval_steps 100
 
+
+# Most recent command I used
 accelerate launch --config_file examples/accelerate_configs/deepspeed_zero2.yaml \
     examples/scripts/ppo/ppo_testing_v2.py \
     --dataset_name trl-internal-testing/tldr-preference-sft-trl-style \
     --dataset_test_split validation \
     --output_dir models/minimal/ppo_tldr \
-    --learning_rate 2.0e-7 \
-    --per_device_train_batch_size 8 \
+    --learning_rate 1.0e-5 \
+    --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 8 \
-    --total_episodes 10000 \
+    --total_episodes 30000 \
     --model_name_or_path EleutherAI/pythia-1b-deduped \
     --sft_model_path cleanrl/EleutherAI_pythia-1b-deduped__sft__tldr \
     --reward_model_path cleanrl/EleutherAI_pythia-1b-deduped__reward__tldr \
-    --local_rollout_forward_batch_size 8 \
-    --local_mini_batch_size 1 \
+    --local_rollout_forward_batch_size 1 \
     --cliprange 0.2 \
     --cliprange_value 0.2 \
     --vf_coef 0.2 \
@@ -176,21 +177,6 @@ def build_reward_fn(
     
     return reward_fn
 
-def generate_from_policy_model(policy_model, tokenizer, prompt, max_new_tokens=100):
-    inputs = tokenizer(prompt, return_tensors="pt").to(policy_model.device)
-    with torch.no_grad():
-        outputs = policy_model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            top_k=50,
-            top_p=0.95,
-            temperature=0.7,
-            pad_token_id=tokenizer.eos_token_id
-        )
-    return tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-
 class ServerRewardBackbone(nn.Module):
     def forward(self, input_ids=None, attention_mask=None, position_ids=None, **_):
         with torch.no_grad():
@@ -237,18 +223,11 @@ class QAAccuracyCallback(TrainerCallback):
         if state.global_step % self.callback_freq != 1:
             return
             
-        print("KWARGS KEYS:", list(kwargs.keys()))
-        """Compute accuracy metrics on responses generated during training"""
-        print(f"DEBUG: on_step_end called at step {state.global_step}")
-        
         trainer = self.trainer
         if trainer is None:
             print("DEBUG: trainer is None")
             return
-            
-        # Generate a small batch of responses for evaluation
-        print("DEBUG: Generating responses for QA evaluation on VALIDATION dataset...")
-        
+
         # Get a random sample from the VALIDATION dataset (like TRLX does)
         # This ensures we're measuring generalization, not memorization
         sample_size = 20  # Small number to avoid memory issues
@@ -275,10 +254,6 @@ class QAAccuracyCallback(TrainerCallback):
             # Decode the full conversation (prompt + response)
             full_conversation = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
             full_conversations.append(full_conversation)
-        
-        print(f"DEBUG: Generated {len(full_conversations)} conversations")
-        print(f"DEBUG: full_conversations = {full_conversations[:2]}")  # Show first 2 for debugging
-        
         # Parse conversations and compute metrics
         data_items = [self.qa_val_dataset.parse_matching_item(conversation) for conversation in full_conversations]
         
@@ -381,9 +356,7 @@ if __name__ == "__main__":
     policy = AutoModelForCausalLM.from_pretrained(
         path_8b, trust_remote_code=model_args.trust_remote_code, **model_kwargs
     )
-    # Add generation_config to policy
-    from transformers import GenerationConfig
-    policy.generation_config = GenerationConfig.from_pretrained(path_8b)
+
     # Commenting out peft_config to use LoraConfig by default
     peft_config = get_peft_config(model_args)
     if peft_config is None:
