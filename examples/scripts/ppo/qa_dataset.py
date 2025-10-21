@@ -939,7 +939,7 @@ class QADataset:
         """
         return DataCollatorWithPadding(tokenizer=tokenizer, padding="longest")
     
-    def aaryan_get_hf_dataset(
+    def modified_get_hf_dataset(
         self,
         prompt_type: Literal["agent", "reward model"],
         tokenizer: AutoTokenizer,
@@ -947,7 +947,9 @@ class QADataset:
         tokenize_fn: Optional[Callable] = None,
     ) -> Dataset:
         """
-        Converts a 'QADataset' into a Hugging Face 'Dataset'.
+        Modified function that converts a 'QADataset' into a Hugging Face 'Dataset'.
+        Modifications include skipping bos token when building the prompt for the agent,
+        and tokenization is done in batches of 16 with padding.
 
         Args:
             prompt_type (Literal["agent", "reward model"]): The type of prompt to convert.

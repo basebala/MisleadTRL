@@ -15,36 +15,29 @@
 import shutil
 
 import torch
-from accelerate import PartialState, Accelerator
-from datasets import load_dataset
+from accelerate import PartialState
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForSequenceClassification,
     AutoTokenizer,
-    BitsAndBytesConfig,
     HfArgumentParser,
 )
 from qa_dataset import QADataset
-from torch.utils.data import DataLoader
-from transformers import DataCollatorWithPadding
 
 from trl import (
-    AutoModelForCausalLMWithValueHead,
     ModelConfig,
     PPOConfig,
     PPOTrainer,
     ScriptArguments,
-    get_kbit_device_map,
     get_peft_config,
-    get_quantization_config,
 )
 from transformers import TrainerCallback, TrainerState, TrainerControl, TrainingArguments
 import requests
 from transformers.modeling_outputs import BaseModelOutput
 from torch import nn
 import json
-from typing import Any, Callable, Dict, List, Optional
-from peft import get_peft_model, LoraConfig, TaskType
+from typing import Any, Callable, List
+from peft import LoraConfig, TaskType
 import random
 
 
@@ -52,6 +45,7 @@ from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
 import numpy as np
 
 """
+Below is the default python command for the example script from TRL
 python examples/scripts/ppo/ppo_testing_v2.py \
     --dataset_name trl-internal-testing/tldr-preference-sft-trl-style \
     --dataset_test_split validation \
@@ -70,13 +64,13 @@ python examples/scripts/ppo/ppo_testing_v2.py \
     --eval_steps 100
 
 
-# Most recent command I used
+Run this command to follow our experimental setup
 accelerate launch --config_file examples/accelerate_configs/deepspeed_zero2.yaml \
     examples/scripts/ppo/ppo_testing_v2.py \
     --dataset_name trl-internal-testing/tldr-preference-sft-trl-style \
     --dataset_test_split validation \
     --output_dir models/minimal/ppo_tldr \
-    --learning_rate 1.0e-5 \
+    --learning_rate 2.0e-5 \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 8 \
     --total_episodes 30000 \
@@ -87,7 +81,7 @@ accelerate launch --config_file examples/accelerate_configs/deepspeed_zero2.yaml
     --cliprange 0.2 \
     --cliprange_value 0.2 \
     --vf_coef 0.2 \
-    --kl_coef 0.01 \
+    --kl_coef 0.05 \
     --missing_eos_penalty 1.0 \
     --stop_token eos \
     --eval_strategy steps \
@@ -96,15 +90,6 @@ accelerate launch --config_file examples/accelerate_configs/deepspeed_zero2.yaml
     --temperature 0.8 \
     --seed 1000
 """
-
-def print_gpu_memory(device=0):
-    device = torch.device("cuda")
-    print(f"Peak GPU Mem: {torch.cuda.max_memory_allocated() / 1024**2:.2f} MB")
-    total_memory = torch.cuda.get_device_properties(device).total_memory
-    print(f"Total GPU memory: {total_memory / 1e9:.2f} GB")
-    allocated = torch.cuda.memory_allocated(device) / (1024**2)
-    reserved = torch.cuda.memory_reserved(device) / (1024**2)
-    print(f"[GPU {device}] Allocated: {allocated:.2f} MB, Reserved: {reserved:.2f} MB")
 
 def get_scores_from_reward_model(prompts: List[str]) -> torch.Tensor:
     """
@@ -154,23 +139,8 @@ def build_reward_fn(
             )
             for item in data_items
         ]
-        """Commenting out reference prompt to only use agent prompt for reward model scoring
-        reward_model_prompts_reference = [
-            item.build_prompt_for_reward_model(
-                tokenizer,
-                skip_start_and_end_tokens=skip_start_and_end_tokens,
-                use_original_argument=True,
-            )
-            for item in data_items
-        ]
-        """
         if compute_reward_model_scores:
             scores_agent = get_scores_from_reward_model(reward_model_prompts_agent)
-            """ Commenting out reference prompt to only use agent prompt for reward model scoring
-            scores_reference = get_scores_from_reward_model(
-                reward_model_prompts_reference
-            )
-            """
             return scores_agent 
         else:
             return -torch.ones(len(samples))
@@ -178,31 +148,73 @@ def build_reward_fn(
     return reward_fn
 
 class ServerRewardBackbone(nn.Module):
+    """
+    Minimal dummy backbone module that passes input_ids as hidden states.
+    This avoids running an actual transformer forward pass since rewards
+    are computed by an external server.
+    """
     def forward(self, input_ids=None, attention_mask=None, position_ids=None, **_):
+        """
+        Forward pass that converts input_ids to dummy hidden states.
+        
+        Args:
+            input_ids: Token IDs of shape (batch_size, seq_len)
+            attention_mask: Attention mask (unused, accepted for API compatibility)
+            position_ids: Position IDs (unused, accepted for API compatibility)
+            **_: Additional unused arguments
+        
+        Returns:
+            BaseModelOutput with hidden_states containing the input_ids as floats
+        """
         with torch.no_grad():
+            # Extract batch size and sequence length
             batch, seq_len = input_ids.shape
+            # Convert input_ids to float and add a hidden dimension to mimic transformer output
             dummy = input_ids.to(dtype=torch.float32).unsqueeze(-1)
+            # Return as BaseModelOutput to match transformer backbone interface
             return BaseModelOutput(hidden_states=(dummy,))
 
 class ServerRewardModel(nn.Module):
+    """
+    Custom reward model that computes rewards using an external server.
+    Instead of running a full transformer, it decodes tokens to text and
+    sends them to a reward function that queries the external server.
+    """
     def __init__(self, tokenizer, qaCopy, url="http://localhost:8115/reward"):
         super().__init__()
         self.tokenizer = tokenizer
         self.url = url
 
+        # Required attribute for compatibility with TRL's reward model interface
         self.base_model_prefix = "llama"
+        # Build the reward function that will query the external server
         self.reward_fn = build_reward_fn(qaCopy, tokenizer)
-        self.llama = ServerRewardBackbone()  # **distinct** module
+        # Use the dummy backbone to avoid unnecessary computation
+        self.llama = ServerRewardBackbone()
+        # Dummy parameter to ensure model has at least one trainable parameter
         self.dummy = nn.Parameter(torch.zeros(1))
 
     def score(self, last_hidden_state: torch.Tensor) -> torch.Tensor:
-        print_gpu_memory()
+        """
+        Compute reward scores by decoding tokens to text and querying external server.
+        
+        Args:
+            last_hidden_state: Hidden states from backbone (actually contains input_ids)
+        
+        Returns:
+            Reward logits tensor of shape (batch_size, seq_len, 1)
+        """
         with torch.no_grad():
+            # Extract input_ids from the dummy hidden states
             ids = last_hidden_state[..., 0].to(torch.long)
+            # Decode token IDs to text strings
             texts = self.tokenizer.batch_decode(ids, skip_special_tokens=True)
+            # Get reward scores from external server via reward_fn
             scores = self.reward_fn(texts)
             B, T = ids.shape
-            reward_logits = scores.unsqueeze(1).expand(-1, T).unsqueeze(-1).to(ids.device)  # shape: (B, T)
+            # Expand scalar rewards to match sequence length dimension
+            reward_logits = scores.unsqueeze(1).expand(-1, T).unsqueeze(-1).to(ids.device)
+            # Clean up intermediate tensors
             del ids, texts, scores
             return reward_logits
 
@@ -238,7 +250,6 @@ class QAAccuracyCallback(TrainerCallback):
         full_conversations = []
         for item in sample_data:
             prompt = item.build_prompt_for_agent(self.tokenizer, skip_bos=True)
-            # Generate response using the policy model
             inputs = self.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
             inputs = {k: v.to(trainer.model.policy.device) for k, v in inputs.items()}
             
@@ -303,7 +314,6 @@ class QAAccuracyCallback(TrainerCallback):
 
 if __name__ == "__main__":
     path_8b = "/nas/ucb/aaryanchandna/code/trl/examples/scripts/ppo/model_checkpoints/SFT/SFT_Llama-3.1-8B_lr1e-6_bs32_maxepoch5_numgpus8_25-04-23_08:48:27/checkpoint-80/checkpoint-80"
-    path_1b = "meta-llama/Llama-3.2-1B"
     parser = HfArgumentParser((ScriptArguments, PPOConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_into_dataclasses()
     # remove output_dir if exists
@@ -312,35 +322,13 @@ if __name__ == "__main__":
     ################
     # Model & Tokenizer
     ################
-    """ Commenting out torch_dtype to use bfloat16 by default
-    torch_dtype = (
-        model_args.torch_dtype if model_args.torch_dtype in ["auto", None] else getattr(torch, model_args.torch_dtype)
-    )
-    """
-
-    """ Commenting out quantization config to use 4-bit by default
-    quantization_config = get_quantization_config(model_args)
-    """
-    # High-quality quantization config - minimal quality loss
-    quantization_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,  # bfloat16 for best quality/speed balance
-        bnb_4bit_use_double_quant=True,         # Double quantization for better precision
-        bnb_4bit_quant_type="nf4",              # NF4 is optimal for neural networks
-        bnb_4bit_quant_storage=torch.uint8,     # Efficient storage
-    )
     torch_dtype = torch.bfloat16
-    # Choose attention implementation based on availability
     attn_impl = "flash_attention_2" 
     print(f"Using attention implementation: {attn_impl}")
-    
     model_kwargs = dict(
         revision=model_args.model_revision,
         attn_implementation=attn_impl,
         torch_dtype=torch_dtype,
-        # quantization_config=quantization_config,
-        # device_map="auto",  # Automatic device mapping for quantized models
-        # low_cpu_mem_usage=True,  # Faster loading
     )
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -349,7 +337,7 @@ if __name__ == "__main__":
     tokenizer.pad_token = tokenizer.eos_token
     if tokenizer.chat_template is None:
         tokenizer.chat_template = SIMPLE_CHAT_TEMPLATE
-    # Use separate models with quantization - shared models cause recursion issues
+    
     value_model = AutoModelForSequenceClassification.from_pretrained(
         path_8b, num_labels=1, trust_remote_code=model_args.trust_remote_code, **model_kwargs
     )
@@ -357,7 +345,6 @@ if __name__ == "__main__":
         path_8b, trust_remote_code=model_args.trust_remote_code, **model_kwargs
     )
 
-    # Commenting out peft_config to use LoraConfig by default
     peft_config = get_peft_config(model_args)
     if peft_config is None:
         ref_policy = AutoModelForCausalLM.from_pretrained(
@@ -367,7 +354,7 @@ if __name__ == "__main__":
         ref_policy = None
     peft_config = LoraConfig(
         r=16,
-        target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],  # or ["attn.c_attn"] depending on model
+        target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
         lora_dropout=0.05,
         bias="none",
         task_type=TaskType.CAUSAL_LM,
@@ -375,12 +362,17 @@ if __name__ == "__main__":
     ################
     # Dataset
     ################
-    """ Commenting out dataset loading to use custom QADataset
-    dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
-    train_dataset = dataset[script_args.dataset_train_split]
-    eval_dataset = dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None
-    """
     def prepare_qa_dataset(dataset, tokenizer):
+        """
+        Prepares QA dataset for PPO training by extracting input_ids and computing lengths.
+        
+        Args:
+            dataset: HuggingFace dataset with pre-tokenized input_ids
+            tokenizer: Tokenizer (not used here, but kept for API consistency)
+        
+        Returns:
+            Processed dataset with 'input_ids' and 'lengths' columns
+        """
         def column_handler(element):
             input_ids = element["input_ids"]
             return {
@@ -400,53 +392,27 @@ if __name__ == "__main__":
     qa = QADataset(train_data_path=train_data_path, val_data_path=val_data_path, include_argument_and_label=False)
     qa_train = QADataset(train_data_path=train_data_path, val_data_path=None)
     reward_model = ServerRewardModel(tokenizer, qa)
-    train_dataset = qa_train.aaryan_get_hf_dataset("agent", tokenizer=tokenizer, tokenize=True)
-    eval_dataset = qa_val.aaryan_get_hf_dataset("agent", tokenizer=tokenizer, tokenize=True)
+    train_dataset = qa_train.modified_get_hf_dataset("agent", tokenizer=tokenizer, tokenize=True)
+    eval_dataset = qa_val.modified_get_hf_dataset("agent", tokenizer=tokenizer, tokenize=True)
 
-    def prepare_dataset(dataset, tokenizer):
-        """pre-tokenize the dataset before training; only collate during training"""
-
-        def tokenize(element):
-            input_ids = tokenizer.apply_chat_template(
-                element["messages"][:1],
-                padding=False,
-                add_generation_prompt=True,
-            )
-            # input_ids = tokenizer(element["messages"][:1][0]["content"], add_special_tokens=False)["input_ids"]
-            return {"input_ids": input_ids, "lengths": len(input_ids)}
-
-        return dataset.map(
-            tokenize,
-            remove_columns=dataset.column_names,
-            num_proc=training_args.dataset_num_proc,
-        )
-    # # # Compute that only on the main process for faster data processing.
-    # # # see: https://github.com/huggingface/trl/pull/1255
+    # Compute that only on the main process for faster data processing
+    # See: https://github.com/huggingface/trl/pull/1255
     with PartialState().local_main_process_first():
         train_dataset = prepare_qa_dataset(train_dataset, tokenizer)
         if eval_dataset is not None:
             eval_dataset = prepare_qa_dataset(eval_dataset, tokenizer)
-    """ Commenting out filtering to allow sequences longer than 512
-        # filtering
-        train_dataset = train_dataset.filter(lambda x: x["lengths"] <= 512, num_proc=training_args.dataset_num_proc)
-        if eval_dataset is not None:
-            eval_dataset = eval_dataset.filter(lambda x: x["lengths"] <= 512, num_proc=training_args.dataset_num_proc)
-    """
 
-    """ Commenting out assertion on EOS token
-    assert train_dataset[0]["input_ids"][-1] != tokenizer.eos_token_id, "The last token should not be an EOS token"
-    """
-    # # ################
-    # # Training
-    # ################
+    ################
+    # Training
+    ################
     # Enable gradient checkpointing for memory efficiency
     for module in [policy, value_model, reward_model, ref_policy]:
         if module is not None and hasattr(module, 'gradient_checkpointing_enable'):
             module.gradient_checkpointing_enable()
-    print_gpu_memory()
-    # Additional optimizer and scheduler configurations from your config
+
+    # Additional optimizer and scheduler configurations from original config
     if hasattr(training_args, 'optim'):
-        training_args.optim = "adamw_torch"  # Use AdamW optimizer
+        training_args.optim = "adamw_torch"
     if hasattr(training_args, 'weight_decay'):
         training_args.weight_decay = 0.01
     if hasattr(training_args, 'adam_epsilon'):
@@ -459,10 +425,10 @@ if __name__ == "__main__":
     trainer = PPOTrainer(
         args=training_args,
         processing_class=tokenizer,
-        model=policy,  # The policy model (separate from value model)
+        model=policy,  
         ref_model=ref_policy,
         reward_model=reward_model,
-        value_model=value_model,  # Separate value model for memory efficiency
+        value_model=value_model,  
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         peft_config=peft_config,
@@ -475,11 +441,7 @@ if __name__ == "__main__":
     
     trainer.train()
     
-    """Commenting out saving, pushing to hub and generating completions for testing purposes
-    # Save and push to hub
+
     trainer.save_model(training_args.output_dir)
-    if training_args.push_to_hub:
-        trainer.push_to_hub(dataset_name=script_args.dataset_name)
 
     trainer.generate_completions()
-    """
