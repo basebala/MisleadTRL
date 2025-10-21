@@ -231,6 +231,18 @@ class QAAccuracyCallback(TrainerCallback):
         self.callback_freq = callback_freq  # Run callback every N steps
         
     def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        """
+        Called at the end of each training step to evaluate QA accuracy.
+        
+        Generates responses on validation samples and computes accuracy metrics
+        to track model performance during training.
+        
+        Args:
+            args: Training arguments
+            state: Current trainer state with step information
+            control: Training control flags
+            **kwargs: Additional keyword arguments
+        """
         # Only run callback every callback_freq steps
         if state.global_step % self.callback_freq != 1:
             return
@@ -352,6 +364,8 @@ if __name__ == "__main__":
         )
     else:
         ref_policy = None
+    
+    # Configure LoRA for efficient fine-tuning of the policy model
     peft_config = LoraConfig(
         r=16,
         target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
