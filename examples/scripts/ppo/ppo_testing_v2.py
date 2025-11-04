@@ -70,7 +70,7 @@ accelerate launch --config_file examples/accelerate_configs/deepspeed_zero2.yaml
     --dataset_name trl-internal-testing/tldr-preference-sft-trl-style \
     --dataset_test_split validation \
     --output_dir models/minimal/ppo_tldr \
-    --learning_rate 2.0e-5 \
+    --learning_rate 1.0e-5 \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 8 \
     --total_episodes 30000 \
@@ -81,14 +81,16 @@ accelerate launch --config_file examples/accelerate_configs/deepspeed_zero2.yaml
     --cliprange 0.2 \
     --cliprange_value 0.2 \
     --vf_coef 0.2 \
-    --kl_coef 0.05 \
+    --kl_coef 0.01 \
     --missing_eos_penalty 1.0 \
     --stop_token eos \
     --eval_strategy steps \
     --eval_steps 128 \
     --response_length 256 \
     --temperature 0.8 \
-    --seed 1000
+    --seed 1000 \
+    --save_strategy steps \
+    --save_steps 20
 """
 
 def get_scores_from_reward_model(prompts: List[str]) -> torch.Tensor:
@@ -221,21 +223,21 @@ class ServerRewardModel(nn.Module):
 
 class QAAccuracyCallback(TrainerCallback):
     """
-    Callback to compute QA accuracy metrics on validation dataset
+    Callback to compute QA accuracy metrics on validation dataset.
+    Parallelized across all GPUs for efficient evaluation on entire dataset.
     """
     
-    def __init__(self, qa_val_dataset: QADataset, tokenizer, eval_steps: int = 100, callback_freq: int = 10):
+    def __init__(self, qa_val_dataset: QADataset, tokenizer, eval_steps: int = 100, callback_freq: int = 20, batch_size: int = 4):
         self.qa_val_dataset = qa_val_dataset
         self.tokenizer = tokenizer
         self.eval_steps = eval_steps
         self.callback_freq = callback_freq  # Run callback every N steps
+        self.batch_size = batch_size  # Batch size for inference
         
     def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
         """
         Called at the end of each training step to evaluate QA accuracy.
-        
-        Generates responses on validation samples and computes accuracy metrics
-        to track model performance during training.
+        NOW PARALLELIZED: Splits evaluation across all GPUs and evaluates on ENTIRE validation dataset!
         
         Args:
             args: Training arguments
@@ -249,79 +251,120 @@ class QAAccuracyCallback(TrainerCallback):
             
         trainer = self.trainer
         if trainer is None:
-            print("DEBUG: trainer is None")
             return
-
-        # Get a random sample from the VALIDATION dataset (like TRLX does)
-        # This ensures we're measuring generalization, not memorization
-        sample_size = 20  # Small number to avoid memory issues
+        
+        # Get accelerator for multi-GPU support
+        accelerator = trainer.accelerator
+        
+        if accelerator.is_main_process:
+            print(f"\n{'='*80}")
+            print(f"QA EVALUATION @ Step {state.global_step} - Using ALL {accelerator.num_processes} GPUs")
+            print(f"{'='*80}")
+        
+        # Get ENTIRE validation dataset (not just 100 samples!)
         val_data = [item for item in self.qa_val_dataset.data.values() if not item.is_train]
-        sample_data = random.sample(val_data, min(sample_size, len(val_data)))
         
-        # Generate responses
-        full_conversations = []
-        for item in sample_data:
-            prompt = item.build_prompt_for_agent(self.tokenizer, skip_bos=True)
-            inputs = self.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
-            inputs = {k: v.to(trainer.model.policy.device) for k, v in inputs.items()}
+        if accelerator.is_main_process:
+            print(f"Total validation samples: {len(val_data)}")
+            print(f"Samples per GPU: ~{len(val_data) // accelerator.num_processes}")
+        
+        # Split data across all GPUs using Accelerate
+        with accelerator.split_between_processes(val_data) as val_data_chunk:
+            print(f"[GPU {accelerator.process_index}] Processing {len(val_data_chunk)} samples")
             
-            with torch.no_grad():
-                outputs = trainer.model.policy.generate(
-                    **inputs,
-                    max_new_tokens=256,
-                    do_sample=True,
-                    temperature=0.7,
-                    pad_token_id=self.tokenizer.eos_token_id
-                )
+            # Generate responses with batching
+            all_predictions = []
+            true_answers = []
             
-            # Decode the full conversation (prompt + response)
-            full_conversation = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            full_conversations.append(full_conversation)
-        # Parse conversations and compute metrics
-        data_items = [self.qa_val_dataset.parse_matching_item(conversation) for conversation in full_conversations]
+            # Batch processing for efficiency
+            for i in range(0, len(val_data_chunk), self.batch_size):
+                batch_items = val_data_chunk[i:i + self.batch_size]
+                
+                # Build prompts for batch
+                prompts = [item.build_prompt_for_agent(self.tokenizer, skip_bos=True) for item in batch_items]
+                
+                # Tokenize batch
+                inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
+                inputs = {k: v.to(trainer.model.policy.device) for k, v in inputs.items()}
+                
+                with torch.no_grad():
+                    outputs = trainer.model.policy.generate(
+                        **inputs,
+                        max_new_tokens=256,
+                        do_sample=True,
+                        temperature=0.8,
+                        pad_token_id=self.tokenizer.eos_token_id
+                    )
+                
+                # Decode and parse immediately to save memory
+                for j, output in enumerate(outputs):
+                    full_conversation = self.tokenizer.decode(output, skip_special_tokens=True)
+                    
+                    # Parse immediately
+                    parsed_item = self.qa_val_dataset.parse_matching_item(full_conversation)
+                    all_predictions.append(parsed_item.predicted_answer)
+                    
+                    # Get true answer for this item
+                    item_idx = i + j
+                    true_answer = "A" if val_data_chunk[item_idx].correct_answer_id == 0 else "B"
+                    true_answers.append(true_answer)
+                
+                # Free memory
+                del outputs, inputs
+                if i % 10 == 0:
+                    torch.cuda.empty_cache()
         
-        # Get true answers
-        true_answers = [
-            "A" if item.correct_answer_id == 0 else "B" for item in data_items
-        ]
+        # Gather results from all GPUs
+        if accelerator.is_main_process:
+            print(f"\nGathering results from all {accelerator.num_processes} GPUs...")
         
-        # Compute accuracy metrics
-        accuracy = np.mean([
-            data_items[index].predicted_answer == true_answers[index]
-            for index in range(len(data_items))
-        ])
+        true_answers = accelerator.gather_for_metrics(true_answers)
+        all_predictions = accelerator.gather_for_metrics(all_predictions)
         
-        accuracy_where_complete = np.mean([
-            data_items[index].predicted_answer == true_answers[index]
-            for index in range(len(data_items))
-            if data_items[index].predicted_answer is not None
-        ])
-        
-        fraction_incomplete = np.mean([
-            item.predicted_answer is None for item in data_items
-        ])
-        
-        fraction_model_responds_A = np.mean([
-            item.predicted_answer == "A" for item in data_items
-        ])
-        
-        fraction_model_responds_B = np.mean([
-            item.predicted_answer == "B" for item in data_items
-        ])
-        
-        # Log metrics (using eval/ prefix since this is validation data)
-        metrics = {
-            "eval/qa_accuracy": accuracy,
-            "eval/qa_accuracy_where_complete": accuracy_where_complete,
-            "eval/qa_fraction_incomplete": fraction_incomplete,
-            "eval/qa_fraction_model_responds_A": fraction_model_responds_A,
-            "eval/qa_fraction_model_responds_B": fraction_model_responds_B,
-        }
-        
-        # Log to trainer
-        trainer.log(metrics)
-        
-        print(f"QA Accuracy: {accuracy:.3f}, Complete: {accuracy_where_complete:.3f}, Incomplete: {fraction_incomplete:.3f}")
+        # Only main process computes and logs metrics
+        if accelerator.is_main_process:
+            print(f"✓ Gathered {len(all_predictions)} total samples")
+            
+            # Compute accuracy metrics
+            accuracy = np.mean([
+                pred == true for pred, true in zip(all_predictions, true_answers)
+            ])
+            
+            complete_mask = [pred is not None for pred in all_predictions]
+            if sum(complete_mask) > 0:
+                accuracy_where_complete = np.mean([
+                    all_predictions[i] == true_answers[i]
+                    for i in range(len(all_predictions))
+                    if complete_mask[i]
+                ])
+            else:
+                accuracy_where_complete = 0.0
+            
+            fraction_incomplete = np.mean([pred is None for pred in all_predictions])
+            fraction_model_responds_A = np.mean([pred == "A" for pred in all_predictions])
+            fraction_model_responds_B = np.mean([pred == "B" for pred in all_predictions])
+            
+            # Log metrics (using eval/ prefix since this is validation data)
+            metrics = {
+                "eval/qa_accuracy": accuracy,
+                "eval/qa_accuracy_where_complete": accuracy_where_complete,
+                "eval/qa_fraction_incomplete": fraction_incomplete,
+                "eval/qa_fraction_model_responds_A": fraction_model_responds_A,
+                "eval/qa_fraction_model_responds_B": fraction_model_responds_B,
+                "eval/qa_total_samples": len(all_predictions),
+            }
+            
+            # Log to trainer
+            trainer.log(metrics)
+            
+            print(f"\n{'='*80}")
+            print(f"QA RESULTS (n={len(all_predictions)}):")
+            print(f"  Accuracy: {accuracy:.3f} ({accuracy*100:.1f}%)")
+            print(f"  Complete: {accuracy_where_complete:.3f} ({accuracy_where_complete*100:.1f}%)")
+            print(f"  Incomplete: {fraction_incomplete:.3f} ({fraction_incomplete*100:.1f}%)")
+            print(f"  Responds A: {fraction_model_responds_A:.3f}")
+            print(f"  Responds B: {fraction_model_responds_B:.3f}")
+            print(f"{'='*80}\n")
 
 
 if __name__ == "__main__":
@@ -435,6 +478,8 @@ if __name__ == "__main__":
         training_args.adam_beta1 = 0.9
     if hasattr(training_args, 'adam_beta2'):
         training_args.adam_beta2 = 0.999
+    if hasattr(training_args, 'save_only_model'):
+        training_args.save_only_model = True  # Don't save optimizer states in checkpoints
         
     trainer = PPOTrainer(
         args=training_args,
@@ -449,9 +494,24 @@ if __name__ == "__main__":
     )
     
     # Add QA accuracy callback (using validation dataset like TRLX)
-    qa_accuracy_callback = QAAccuracyCallback(qa_val, tokenizer, eval_steps=100, callback_freq=10)
+    # NOW PARALLELIZED: Evaluates on entire validation dataset across all GPUs!
+    qa_accuracy_callback = QAAccuracyCallback(
+        qa_val, 
+        tokenizer, 
+        eval_steps=100, 
+        callback_freq=20,
+        batch_size=4  # Batch size per GPU for efficient evaluation
+    )
     qa_accuracy_callback.trainer = trainer
     trainer.add_callback(qa_accuracy_callback)
+    
+    print(f"\n{'='*80}")
+    print(f"✅ QA Evaluation Callback Initialized:")
+    print(f"   - Runs every {20} steps")
+    print(f"   - Evaluates on ENTIRE validation dataset ({len([x for x in qa_val.data.values() if not x.is_train])} samples)")
+    print(f"   - Parallelized across {trainer.accelerator.num_processes} GPUs")
+    print(f"   - Batch size per GPU: {4}")
+    print(f"{'='*80}\n")
     
     trainer.train()
     
