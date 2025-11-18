@@ -51,6 +51,12 @@ import sys
 import os
 from typing import List, Dict, Optional
 from accelerate import Accelerator
+from datetime import datetime
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except Exception:
+    _WANDB_AVAILABLE = False
 
 # Add parent directory to path to import qa_dataset
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -158,10 +164,50 @@ def parse_args():
         default=8,
         help="Batch size for inference per GPU (higher = faster but more memory)"
     )
+    parser.add_argument(
+        "--sft_only",
+        action="store_true",
+        help="Load pure SFT weights without applying LoRA adapters"
+    )
+    parser.add_argument(
+        "--wandb",
+        action="store_true",
+        help="Enable logging results to Weights & Biases"
+    )
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default=None,
+        help="W&B project name"
+    )
+    parser.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default=None,
+        help="W&B run name"
+    )
+    parser.add_argument(
+        "--wandb_group",
+        type=str,
+        default=None,
+        help="W&B group name"
+    )
+    parser.add_argument(
+        "--wandb_entity",
+        type=str,
+        default=None,
+        help="W&B entity (team) name"
+    )
+    parser.add_argument(
+        "--wandb_tags",
+        type=str,
+        default=None,
+        help="Comma-separated list of W&B tags"
+    )
     return parser.parse_args()
 
 
-def load_model_and_tokenizer(model_path, base_model_path, accelerator: Accelerator):
+def load_model_and_tokenizer(model_path, base_model_path, accelerator: Accelerator, sft_only: bool = False):
     """
     Load the LoRA-adapted model and tokenizer.
     
@@ -182,23 +228,12 @@ def load_model_and_tokenizer(model_path, base_model_path, accelerator: Accelerat
     if accelerator.is_main_process:
         print(f"Loading tokenizer from {model_path}...")
     
-    # Try loading tokenizer from model_path first, fall back to base_model_path
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_path,
-            padding_side="left",
-            trust_remote_code=True,
-            local_files_only=True
-        )
-    except Exception as e:
-        if accelerator.is_main_process:
-            print(f"Could not load tokenizer from {model_path}, trying base model path...")
-        tokenizer = AutoTokenizer.from_pretrained(
-            base_model_path,
-            padding_side="left",
-            trust_remote_code=True,
-            local_files_only=True
-        )
+    tokenizer = AutoTokenizer.from_pretrained(
+        base_model_path,
+        padding_side="left",
+        trust_remote_code=True,
+        local_files_only=True
+    )
     tokenizer.pad_token = tokenizer.eos_token
     
     if accelerator.is_main_process:
@@ -211,10 +246,14 @@ def load_model_and_tokenizer(model_path, base_model_path, accelerator: Accelerat
         local_files_only=True
     )
     
-    if accelerator.is_main_process:
-        print(f"Loading LoRA adapters from {model_path}...")
-    
-    model = PeftModel.from_pretrained(base_model, model_path)
+    if sft_only:
+        if accelerator.is_main_process:
+            print("Running evaluation with pure SFT weights (no LoRA adapters).")
+        model = base_model
+    else:
+        if accelerator.is_main_process:
+            print(f"Loading LoRA adapters from {model_path}...")
+        model = PeftModel.from_pretrained(base_model, model_path)
     model.eval()
     
     if accelerator.is_main_process:
@@ -275,6 +314,7 @@ def evaluate_model(model, tokenizer, qa_dataset, args, accelerator: Accelerator)
         all_predictions = []
         true_answers = []
         batch_size = args.batch_size
+        model_for_inference = accelerator.unwrap_model(model)
         
         # Create progress bar only on main process
         iterator = range(0, len(val_data_chunk), batch_size)
@@ -297,9 +337,11 @@ def evaluate_model(model, tokenizer, qa_dataset, args, accelerator: Accelerator)
             
             with torch.no_grad():
                 # Generate for batch
-                outputs = model.generate(
+                outputs = model_for_inference.generate(
                     **inputs,
                     max_new_tokens=args.max_new_tokens,
+                    min_new_tokens=32,
+                    top_p=0.8,
                     do_sample=args.do_sample,
                     temperature=args.temperature,
                     pad_token_id=tokenizer.eos_token_id
@@ -429,6 +471,33 @@ def main():
         split_batches=False,  # Each GPU gets full batch_size
     )
     
+    # Initialize W&B on main process if requested
+    if accelerator.is_main_process and args.wandb:
+        if not _WANDB_AVAILABLE:
+            print("wandb not available; install wandb or disable --wandb.")
+        else:
+            run_name = args.wandb_run_name or f"eval_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+            wandb.init(
+                project=args.wandb_project or "trl-eval",
+                name=run_name,
+                group=args.wandb_group,
+                entity=args.wandb_entity,
+                tags=[t.strip() for t in args.wandb_tags.split(",")] if args.wandb_tags else None,
+                config={
+                    "model_path": args.model_path,
+                    "base_model_path": args.base_model_path,
+                    "val_data_path": args.val_data_path,
+                    "batch_size": args.batch_size,
+                    "max_new_tokens": args.max_new_tokens,
+                    "temperature": args.temperature,
+                    "do_sample": args.do_sample,
+                    "sft_only": args.sft_only,
+                    "num_processes": accelerator.num_processes,
+                    "device": str(accelerator.device),
+                },
+                settings=wandb.Settings(start_method="fork")
+            )
+    
     if accelerator.is_main_process:
         print("=" * 80)
         print("PPO Model Evaluation with 🤗 Accelerate")
@@ -461,7 +530,8 @@ def main():
     model, tokenizer = load_model_and_tokenizer(
         args.model_path,
         args.base_model_path,
-        accelerator
+        accelerator,
+        args.sft_only
     )
     
     # Prepare model with Accelerate (handles device placement)
@@ -506,6 +576,18 @@ def main():
         print(f"Fraction responds B: {metrics['qa_fraction_responds_B']:.4f} ({metrics['qa_fraction_responds_B']*100:.2f}%)")
         print("=" * 80)
         
+        # Log to W&B (metrics only)
+        if args.wandb and _WANDB_AVAILABLE:
+            wandb.log({
+                "qa/accuracy_overall": metrics["qa_accuracy"],
+                "qa/accuracy_complete_only": metrics["qa_accuracy_where_complete"],
+                "qa/fraction_incomplete": metrics["qa_fraction_incomplete"],
+                "qa/fraction_responds_A": metrics["qa_fraction_responds_A"],
+                "qa/fraction_responds_B": metrics["qa_fraction_responds_B"],
+                "qa/total_samples": metrics["total_samples"],
+                "qa/complete_samples": metrics["complete_samples"],
+            })
+        
         # Save results
         print(f"\nSaving results to {args.output_file}...")
         with open(args.output_file, 'w') as f:
@@ -514,6 +596,8 @@ def main():
         
         # Final GPU memory summary
         print_all_gpus_memory("\n=== Final GPU Memory Summary ===")
+        if args.wandb and _WANDB_AVAILABLE:
+            wandb.finish()
 
 
 if __name__ == "__main__":
