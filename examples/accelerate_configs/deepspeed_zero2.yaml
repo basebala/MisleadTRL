@@ -6,6 +6,8 @@ deepspeed_config:
   offload_param_device: none
   zero3_init_flag: false
   zero_stage: 2
+  checkpoint:
+    save_optimizer_states: false
 distributed_type: DEEPSPEED
 downcast_bf16: 'no'
 machine_rank: 0
