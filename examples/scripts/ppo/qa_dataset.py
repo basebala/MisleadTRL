@@ -180,10 +180,10 @@ def build_key(
 
     # Remove all types of whitespace characters from the story because
     # the model might decode some of them wrongly
-    story_cleaned = clean_text(story.strip())
+    # story_cleaned = clean_text(story.strip())
     return hashlib.sha256(
         (
-            story_cleaned
+            "" #story_cleaned
             + question.strip()
             + answers_sorted[0].strip()
             + answers_sorted[1].strip()
@@ -388,9 +388,9 @@ class QADataItem(QADataItemInterface):
             str: The id of the involved QADataItem.
         """
         # Make sure that the output contains all the required information
-        assert "<story>" in history and "</story>" in history, (
-            f"Output must contain a story. Received: {history}"
-        )
+        # assert "<story>" in history and "</story>" in history, (
+        #     f"Output must contain a story. Received: {history}"
+        # )
         assert "<question>" in history and "</question>" in history, (
             f"Output must contain a question. Received: {history}"
         )
@@ -410,13 +410,14 @@ class QADataItem(QADataItemInterface):
 
         # Parse the output
         try:
-            story = history.split("<story>")[1].split("</story>")[0].strip()
+            # story = history.split("<story>")[1].split("</story>")[0].strip()
             question = history.split("<question>")[1].split("</question>")[0].strip()
             answer_a = history.split("<answer_a>")[1].split("</answer_a>")[0].strip()
             answer_b = history.split("<answer_b>")[1].split("</answer_b>")[0].strip()
 
             item_id = build_key(
-                story, question, answer_a, answer_b, argument="", label=None
+                "", #story
+                question, answer_a, answer_b, argument="", label=None
             )
         except Exception as e:
             print(f"Error parsing history {history}: {e}")
