@@ -320,7 +320,7 @@ class QADataItemInterface(abc.ABC):
 
     @abc.abstractmethod
     def build_prompt_for_agent(
-        self, tokenizer: AutoTokenizer, skip_bos: bool = False
+        self, tokenizer: AutoTokenizer, skip_bos: bool = False, paragraph_token_limit: Optional[int] = None
     ) -> str:
         """
         Builds the prompt for the agent based on the QADataItem.
@@ -328,7 +328,7 @@ class QADataItemInterface(abc.ABC):
         Args:
             tokenizer (AutoTokenizer): The tokenizer to use.
             skip_bos (bool, optional): Whether to skip the BOS token. Defaults to False.
-
+            paragraph_token_limit (Optional[int], optional): The maximum number of tokens of the paragraph to include. Defaults to None.
         Returns:
             str: Formatted prompt string for the agent.
         """
@@ -340,6 +340,7 @@ class QADataItemInterface(abc.ABC):
         tokenizer: AutoTokenizer,
         skip_start_and_end_tokens: bool = False,
         use_original_argument: bool = False,
+        include_paragraph: bool = True,
     ) -> str:
         """
         Builds the prompt for the reward model based on the QADataItem.
@@ -350,6 +351,7 @@ class QADataItemInterface(abc.ABC):
             use_original_argument (bool, optional): Whether to use the original argument from the training data.
                 This is used to compare the quality of the agent's argument with the original argument as
                 one can compute 'reward(agent_argument) - reward(original_argument)'. Defaults to False.
+            include_paragraph (bool, optional): Whether to include the paragraph in the prompt. Defaults to True.
         Returns:
             str: Formatted prompt string for the reward model.
         """
@@ -446,7 +448,7 @@ class QADataItem(QADataItemInterface):
                 self.predicted_answer = "B"
 
     def build_prompt_for_agent(
-        self, tokenizer: AutoTokenizer, skip_bos: bool = False
+        self, tokenizer: AutoTokenizer, skip_bos: bool = False, paragraph_token_limit: Optional[int] = None
     ) -> str:
         """
         Builds the prompt for the agent based on the QADataItem.
@@ -454,12 +456,16 @@ class QADataItem(QADataItemInterface):
         Args:
             tokenizer (AutoTokenizer): The tokenizer to use.
             skip_bos (bool, optional): Whether to skip the BOS token. Defaults to False.
-
+            paragraph_token_limit (Optional[int], optional): The maximum number of tokens of the paragraph to include. Defaults to None.
         Returns:
             str: Formatted prompt string for the agent.
         """
+        paragraph = self.paragraph
+        if paragraph_token_limit is not None:
+            paragraph = tokenizer.decode(tokenizer.encode(paragraph, add_special_tokens=False)[:paragraph_token_limit])
+
         user_prompt = AGENT_USER_PROMPT.format(
-            paragraph=self.paragraph,
+            paragraph=paragraph,
             question=self.question,
             answer_a=self.answers[0],
             answer_b=self.answers[1],
@@ -497,6 +503,7 @@ class QADataItem(QADataItemInterface):
         tokenizer: AutoTokenizer,
         skip_start_and_end_tokens: bool = False,
         use_original_argument: bool = False,
+        include_paragraph: bool = True,
     ) -> str:
         """
         Builds the prompt for the reward model on the QADataItem.
@@ -507,7 +514,7 @@ class QADataItem(QADataItemInterface):
             use_original_argument (bool, optional): Whether to use the original argument from the training data.
                 This is used to compare the quality of the agent's argument with the original argument as
                 one can compute 'reward(agent_argument) - reward(original_argument)'. Defaults to False.
-
+            include_paragraph (bool, optional): Whether to include the paragraph in the prompt. Defaults to True.
         Returns:
             str: Formatted prompt string for the reward model.
         """
@@ -524,7 +531,7 @@ class QADataItem(QADataItemInterface):
 
         if REWARD_MODEL_IS_INSTRUCT:
             reward_model_user_prompt = REWARD_MODEL_USER_PROMPT.format(
-                paragraph=self.paragraph,
+                paragraph=self.paragraph if include_paragraph else "",
                 question=self.question,
                 answer_a=self.answers[0],
                 answer_b=self.answers[1],
@@ -548,7 +555,7 @@ class QADataItem(QADataItemInterface):
 
         else:
             prompt = PROMPT_TEMPLATE_REWARD_MODEL_BASIC.format(
-                paragraph=self.paragraph,
+                paragraph=self.paragraph if include_paragraph else "",
                 question=self.question,
                 answer_a=self.answers[0],
                 answer_b=self.answers[1],
@@ -868,6 +875,8 @@ class QADataset:
         tokenizer: AutoTokenizer,
         tokenize: bool = False,
         tokenize_fn: Optional[Callable] = None,
+        paragraph_token_limit: Optional[int] = None,
+        include_paragraph_in_reward_model_prompt: bool = True,
     ) -> Dataset:
         """
         Converts a 'QADataset' into a Hugging Face 'Dataset'.
@@ -877,7 +886,8 @@ class QADataset:
             tokenizer (AutoTokenizer): The tokenizer to use.
             tokenize (bool, optional): Whether to tokenize the dataset. Defaults to False.
             tokenize_fn (Optional[Callable], optional): The tokenization function to use. Defaults to None.
-
+            paragraph_token_limit (Optional[int], optional): The maximum number of tokens of the paragraph to include. Defaults to None.
+            include_paragraph_in_reward_model_prompt (bool, optional): Whether to include the paragraph in the reward model prompt. Defaults to True.
         Returns:
             Dataset: A Hugging Face Dataset object.
         """
@@ -890,13 +900,13 @@ class QADataset:
         is_train = [item.is_train for item in self.data.values()]
         if prompt_type == "agent":
             prompts = [
-                item.build_prompt_for_agent(tokenizer) for item in self.data.values()
+                item.build_prompt_for_agent(tokenizer, paragraph_token_limit=paragraph_token_limit) for item in self.data.values()
             ]
             features = {"prompt": prompts, "is_train": is_train}
         elif prompt_type == "reward model":
             prompts = [
                 item.build_prompt_for_reward_model(
-                    tokenizer, skip_start_and_end_tokens=True
+                    tokenizer, skip_start_and_end_tokens=True, include_paragraph=include_paragraph_in_reward_model_prompt
                 )
                 for item in self.data.values()
             ]
@@ -945,6 +955,8 @@ class QADataset:
         tokenizer: AutoTokenizer,
         tokenize: bool = False,
         tokenize_fn: Optional[Callable] = None,
+        paragraph_token_limit: Optional[int] = None,
+        include_paragraph_in_reward_model_prompt: bool = True,
     ) -> Dataset:
         """
         Converts a 'QADataset' into a Hugging Face 'Dataset'.
@@ -954,7 +966,8 @@ class QADataset:
             tokenizer (AutoTokenizer): The tokenizer to use.
             tokenize (bool, optional): Whether to tokenize the dataset. Defaults to False.
             tokenize_fn (Optional[Callable], optional): The tokenization function to use. Defaults to None.
-
+            paragraph_token_limit (Optional[int], optional): The maximum number of tokens of the paragraph to include. Defaults to None.
+            include_paragraph_in_reward_model_prompt (bool, optional): Whether to include the paragraph in the reward model prompt. Defaults to True.
         Returns:
             Dataset: A Hugging Face Dataset object.
         """
@@ -967,13 +980,13 @@ class QADataset:
         is_train = [item.is_train for item in self.data.values()]
         if prompt_type == "agent":
             prompts = [
-                item.build_prompt_for_agent(tokenizer, skip_bos=True) for item in self.data.values()
+                item.build_prompt_for_agent(tokenizer, skip_bos=True, paragraph_token_limit=paragraph_token_limit) for item in self.data.values()
             ]
             features = {"prompt": prompts, "is_train": is_train}
         elif prompt_type == "reward model":
             prompts = [
                 item.build_prompt_for_reward_model(
-                    tokenizer, skip_start_and_end_tokens=True
+                    tokenizer, skip_start_and_end_tokens=True, include_paragraph=include_paragraph_in_reward_model_prompt
                 )
                 for item in self.data.values()
             ]
