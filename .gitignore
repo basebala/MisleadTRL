@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 *.bak
 .gitattributes
 .last_checked
@@ -143,3 +144,7 @@ checklink/cookies.txt
 nbs/wandb/
 examples/notebooks/wandb/
 wandb/
+=======
+.venv/*
+wandb/*
+>>>>>>> 8f0f9fa528ec544898197d3ee622f6052105891c

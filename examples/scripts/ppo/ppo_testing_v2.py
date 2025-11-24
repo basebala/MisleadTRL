@@ -442,6 +442,9 @@ if __name__ == "__main__":
             num_proc=training_args.dataset_num_proc,
         )
 
+    paragraph_token_limit = 500
+    include_paragraph_in_reward_model_prompt = False
+
     train_data_path = "/nas/ucb/aaryanchandna/code/trl/train_qa_le8000.json"
     val_data_path = "/nas/ucb/aaryanchandna/code/trl/val_qa_le8000.json"
     blank_data_path = "/nas/ucb/aaryanchandna/code/trl/blank.json"
@@ -449,8 +452,8 @@ if __name__ == "__main__":
     qa = QADataset(train_data_path=train_data_path, val_data_path=val_data_path, include_argument_and_label=False)
     qa_train = QADataset(train_data_path=train_data_path, val_data_path=None)
     reward_model = ServerRewardModel(tokenizer, qa)
-    train_dataset = qa_train.modified_get_hf_dataset("agent", tokenizer=tokenizer, tokenize=True)
-    eval_dataset = qa_val.modified_get_hf_dataset("agent", tokenizer=tokenizer, tokenize=True)
+    train_dataset = qa_train.modified_get_hf_dataset("agent", tokenizer=tokenizer, tokenize=True, paragraph_token_limit=paragraph_token_limit, include_paragraph_in_reward_model_prompt=include_paragraph_in_reward_model_prompt)
+    eval_dataset = qa_val.modified_get_hf_dataset("agent", tokenizer=tokenizer, tokenize=True, paragraph_token_limit=paragraph_token_limit, include_paragraph_in_reward_model_prompt=include_paragraph_in_reward_model_prompt)
 
     # Compute that only on the main process for faster data processing
     # See: https://github.com/huggingface/trl/pull/1255
