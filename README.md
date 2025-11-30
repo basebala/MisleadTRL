@@ -55,15 +55,23 @@ python -c "from accelerate import Accelerator; print('Accelerate: OK')"
 
 ## Starting the Reward Model Server
 
+**Option 1: Use Pre-trained Reward Model (Recommended)**
+
+You can use a pre-trained reward model from Hugging Face instead of training your own. The reward model checkpoint is available at: [basebala/reward-model-checkpoint-qa](https://huggingface.co/basebala/reward-model-checkpoint-qa)
+
 Start the reward model server from the MisleadLM repository:
 
 ```bash
 # Navigate to the MisleadLM folder
 cd /path/to/MisleadLM
 
-# Start the reward model server
+# Start the reward model server (configure it to use the pre-trained model)
 bash reward_model_general_server.sh
 ```
+
+**Option 2: Train Your Own Reward Model**
+
+If you prefer to train your own reward model, you can do so and then start the server with your custom checkpoint.
 
 **Important:** 
 - The reward model server must be running on `http://localhost:8115/reward` before starting training
