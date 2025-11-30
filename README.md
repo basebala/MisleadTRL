@@ -10,7 +10,6 @@ This guide provides step-by-step instructions for setting up the environment, ru
 4. [Running Training](#running-training)
 5. [Running Evaluation](#running-evaluation)
 6. [Generating Plots](#generating-plots)
-7. [Troubleshooting](#troubleshooting)
 
 ## Prerequisites
 
@@ -54,41 +53,24 @@ python -c "import trl; print(f'TRL: {trl.__version__}')"
 python -c "from accelerate import Accelerator; print('Accelerate: OK')"
 ```
 
-### 4. Configure Accelerate (Optional but Recommended)
-
-For multi-GPU training, configure Accelerate:
-
-```bash
-accelerate config
-```
-
-Follow the prompts to configure your setup. For multi-GPU training, select:
-- Multi-GPU
-- Mixed precision: bf16
-- DeepSpeed (optional, for very large models)
-
 ## Starting the Reward Model Server
 
-**TODO: Add instructions for starting the reward model server from the other repository.**
+Start the reward model server from the MisleadLM repository:
 
-<!-- 
-Example format (edit this section):
 ```bash
-# Navigate to the reward model repository
-cd /path/to/reward-model-repo
+# Navigate to the MisleadLM folder
+cd /path/to/MisleadLM
 
 # Start the reward model server
-python start_reward_server.py --port 8115
-
-# Keep this terminal open - the server must be running during training
+bash reward_model_general_server.sh
 ```
--->
 
-**Important:** The reward model server must be running on `http://localhost:8115/reward` before starting training. The training script will send prompts to this server to get reward scores.
+**Important:** 
+- The reward model server must be running on `http://localhost:8115/reward` before starting training
+- Keep the server running in a separate terminal during training
+- The training script will send prompts to this server to get reward scores
 
 ## Running Training
-
-### Basic Training Command
 
 Navigate to the PPO scripts directory:
 
@@ -96,10 +78,12 @@ Navigate to the PPO scripts directory:
 cd examples/scripts/ppo
 ```
 
-Run training with Accelerate (recommended for multi-GPU):
+Use the `accelerate launch` command format shown in `ppo_testing_v2.py`. The file contains example commands at the top - use those as a reference and modify the arguments as needed for your setup.
+
+Example format (see `ppo_testing_v2.py` for full details):
 
 ```bash
-accelerate launch --multi_gpu \
+accelerate launch --config_file examples/accelerate_configs/deepspeed_zero2.yaml \
     ppo_testing_v2.py \
     --output_dir ./models/ppo_output \
     --learning_rate 1.0e-5 \
@@ -112,8 +96,7 @@ accelerate launch --multi_gpu \
     --eval_steps 100
 ```
 
-### Key Training Arguments
-
+**Key Training Arguments:**
 - `--output_dir`: Directory to save checkpoints and logs
 - `--learning_rate`: Learning rate (default: 1.0e-5)
 - `--per_device_train_batch_size`: Batch size per GPU (default: 1)
@@ -124,19 +107,7 @@ accelerate launch --multi_gpu \
 - `--eval_strategy`: When to run evaluation (`steps`, `epoch`, or `no`)
 - `--eval_steps`: Run evaluation every N steps
 
-### Advanced Training Options
-
-For DeepSpeed support:
-
-```bash
-accelerate launch --config_file ../../accelerate_configs/deepspeed_zero2.yaml \
-    ppo_testing_v2.py \
-    --output_dir ./models/ppo_output \
-    --learning_rate 1.0e-5 \
-    --per_device_train_batch_size 1 \
-    --gradient_accumulation_steps 8 \
-    --total_episodes 30000
-```
+**Note:** The training script uses the SFT checkpoint as the base model. The SFT checkpoint is available on Hugging Face: [basebala/llama-3.1-8b-sft-checkpoint-80](https://huggingface.co/basebala/llama-3.1-8b-sft-checkpoint-80)
 
 ### Monitoring Training
 
@@ -147,54 +118,20 @@ Training progress is automatically logged to:
 
 ## Running Evaluation
 
-### Single-GPU Evaluation
-
-```bash
-python evaluate_ppo_model.py \
-    --model_path ./models/ppo_output/checkpoint-100 \
-    --base_model_path /path/to/base/model \
-    --val_data_path /path/to/val_qa.json \
-    --max_new_tokens 256 \
-    --batch_size 8 \
-    --output_file evaluation_results.json
-```
-
-### Multi-GPU Evaluation (Recommended)
-
-For faster evaluation on large validation sets:
-
-```bash
-accelerate launch --multi_gpu \
-    evaluate_ppo_model.py \
-    --model_path ./models/ppo_output/checkpoint-100 \
-    --base_model_path /path/to/base/model \
-    --val_data_path /path/to/val_qa.json \
-    --max_new_tokens 256 \
-    --batch_size 16 \
-    --output_file evaluation_results.json
-```
-
-### Evaluation Arguments
-
-- `--model_path`: Path to the trained PPO checkpoint (LoRA adapters)
-- `--base_model_path`: Path to the base model (before LoRA)
-- `--val_data_path`: Path to validation QA dataset JSON file
-- `--max_new_tokens`: Maximum tokens to generate (default: 256)
-- `--batch_size`: Batch size per GPU for inference (default: 8)
-- `--temperature`: Sampling temperature (default: 0.7)
-- `--output_file`: Path to save evaluation results JSON
-- `--wandb`: Enable Weights & Biases logging (optional)
-- `--save_predictions`: Save individual predictions to output file (optional)
-
-### Example Evaluation Script
-
-You can also use the provided shell script:
+Use the provided evaluation script:
 
 ```bash
 bash run_evaluation.sh
 ```
 
-Edit `run_evaluation.sh` to customize paths and parameters.
+Edit `run_evaluation.sh` to customize:
+- `--model_path`: Path to your trained PPO checkpoint
+- `--base_model_path`: Path to the base model (SFT checkpoint available at [basebala/llama-3.1-8b-sft-checkpoint-80](https://huggingface.co/basebala/llama-3.1-8b-sft-checkpoint-80))
+- `--val_data_path`: Path to validation QA dataset JSON file
+- `--batch_size`: Batch size per GPU (adjust based on GPU memory)
+- Other evaluation parameters as needed
+
+The script uses `accelerate launch` for multi-GPU evaluation, which significantly speeds up evaluation on large validation sets.
 
 ## Generating Plots
 
@@ -225,43 +162,6 @@ python plot_accuracy_comparison.py \
 - `--wandb_project`: W&B project name (if using W&B)
 - `--wandb_runs`: List of W&B run names to compare
 - `--output_file`: Output path for the plot image
-
-## Troubleshooting
-
-### Common Issues
-
-1. **CUDA Out of Memory**
-   - Reduce `--per_device_train_batch_size`
-   - Increase `--gradient_accumulation_steps` to maintain effective batch size
-   - Enable gradient checkpointing (already enabled by default)
-   - Use DeepSpeed ZeRO for very large models
-
-2. **Reward Model Server Connection Error**
-   - Ensure the reward model server is running on `http://localhost:8115/reward`
-   - Check firewall settings if running on a remote server
-   - Verify the server is responding: `curl http://localhost:8115/reward`
-
-3. **Import Errors**
-   - Make sure the conda environment is activated: `conda activate trl`
-   - Verify all packages are installed: `pip install -r requirements.txt`
-   - Check that you're in the correct directory
-
-4. **Multi-GPU Issues**
-   - Ensure `accelerate config` is properly configured
-   - Use `accelerate launch --multi_gpu` instead of `python` directly
-   - Check GPU visibility: `nvidia-smi`
-
-5. **Slow Evaluation**
-   - Use `accelerate launch --multi_gpu` for multi-GPU evaluation
-   - Increase `--batch_size` if you have sufficient GPU memory
-   - Consider using `--num_samples` to evaluate on a subset first
-
-### Getting Help
-
-- Check the logs in the output directory
-- Review Weights & Biases dashboard for training metrics
-- Ensure all file paths are correct and accessible
-- Verify dataset format matches expected structure
 
 ## Additional Resources
 
