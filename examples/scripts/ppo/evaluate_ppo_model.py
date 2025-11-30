@@ -42,6 +42,7 @@ Configuration:
 
 import argparse
 import json
+# import random
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -229,7 +230,7 @@ def load_model_and_tokenizer(model_path, base_model_path, accelerator: Accelerat
         print(f"Loading tokenizer from {model_path}...")
     
     tokenizer = AutoTokenizer.from_pretrained(
-        base_model_path,
+        model_path,
         padding_side="left",
         trust_remote_code=True,
         local_files_only=True
@@ -284,8 +285,7 @@ def evaluate_model(model, tokenizer, qa_dataset, args, accelerator: Accelerator)
     # Get validation samples (matching training script line 258)
     val_data = [item for item in qa_dataset.data.values() if not item.is_train]
     
-    if args.num_samples is not None:
-        val_data = val_data[:args.num_samples]
+    # val_data = random.sample(val_data, min(100, len(val_data)))
     
     # DEBUG: Check how many processes Accelerate thinks we have
     print(f"[DEBUG GPU {accelerator.process_index}] num_processes={accelerator.num_processes}, is_main={accelerator.is_main_process}")
@@ -310,7 +310,10 @@ def evaluate_model(model, tokenizer, qa_dataset, args, accelerator: Accelerator)
             print(f"{'='*60}\n")
         
         # Generate responses with batching
-        full_conversations = [] if args.save_predictions else None
+        full_conversations = [] if (args.save_predictions or args.wandb) else None
+        questions = [] if args.wandb else None
+        answer_as = [] if args.wandb else None
+        answer_bs = [] if args.wandb else None
         all_predictions = []
         true_answers = []
         batch_size = args.batch_size
@@ -329,7 +332,7 @@ def evaluate_model(model, tokenizer, qa_dataset, args, accelerator: Accelerator)
             batch_items = val_data_chunk[i:i + batch_size]
             
             # Build prompts for batch
-            prompts = [item.build_prompt_for_agent(tokenizer, skip_bos=True) for item in batch_items]
+            prompts = [item.build_prompt_for_agent(tokenizer, skip_bos=True, paragraph_token_limit=450) for item in batch_items]
             
             # Tokenize batch
             inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
@@ -360,9 +363,15 @@ def evaluate_model(model, tokenizer, qa_dataset, args, accelerator: Accelerator)
                 true_answer = "A" if val_data_chunk[item_idx].correct_answer_id == 0 else "B"
                 true_answers.append(true_answer)
                 
-                # Only save conversation if needed
-                if args.save_predictions:
+                # Save conversation if needed
+                if args.save_predictions or args.wandb:
                     full_conversations.append(full_conversation)
+                
+                # Save question/answer info for wandb table
+                if args.wandb:
+                    questions.append(val_data_chunk[item_idx].question)
+                    answer_as.append(val_data_chunk[item_idx].answers[0])
+                    answer_bs.append(val_data_chunk[item_idx].answers[1])
             
             # Free memory after each batch
             del outputs, inputs
@@ -397,10 +406,17 @@ def evaluate_model(model, tokenizer, qa_dataset, args, accelerator: Accelerator)
         print_gpu_memory("After gathering results: ")
     
     # Only gather conversations if we need to save them
-    if args.save_predictions:
+    if args.save_predictions or args.wandb:
         full_conversations = accelerator.gather_for_metrics(full_conversations)
+        if args.wandb:
+            questions = accelerator.gather_for_metrics(questions)
+            answer_as = accelerator.gather_for_metrics(answer_as)
+            answer_bs = accelerator.gather_for_metrics(answer_bs)
     else:
         full_conversations = None
+        questions = None
+        answer_as = None
+        answer_bs = None
     
     # Only the main process computes final metrics
     if accelerator.is_main_process:
@@ -408,6 +424,9 @@ def evaluate_model(model, tokenizer, qa_dataset, args, accelerator: Accelerator)
             "conversations": full_conversations,
             "true_answers": true_answers,
             "predictions": all_predictions,
+            "questions": questions if args.wandb else None,
+            "answer_as": answer_as if args.wandb else None,
+            "answer_bs": answer_bs if args.wandb else None,
         }
     else:
         results = None
@@ -576,7 +595,7 @@ def main():
         print(f"Fraction responds B: {metrics['qa_fraction_responds_B']:.4f} ({metrics['qa_fraction_responds_B']*100:.2f}%)")
         print("=" * 80)
         
-        # Log to W&B (metrics only)
+        # Log to W&B (metrics and completions)
         if args.wandb and _WANDB_AVAILABLE:
             wandb.log({
                 "qa/accuracy_overall": metrics["qa_accuracy"],
@@ -587,6 +606,34 @@ def main():
                 "qa/total_samples": metrics["total_samples"],
                 "qa/complete_samples": metrics["complete_samples"],
             })
+            
+            # Log completions as a wandb table
+            if eval_results["conversations"] is not None:
+                table_data = []
+                for idx, (conv, pred, true, q, a_a, a_b) in enumerate(zip(
+                    eval_results["conversations"],
+                    eval_results["predictions"],
+                    eval_results["true_answers"],
+                    eval_results["questions"],
+                    eval_results["answer_as"],
+                    eval_results["answer_bs"]
+                )):
+                    table_data.append([
+                        idx,
+                        q,
+                        a_a,
+                        a_b,
+                        pred if pred is not None else "None",
+                        true,
+                        "✓" if pred == true else "✗",
+                        conv
+                    ])
+                
+                completions_table = wandb.Table(
+                    columns=["Index", "Question", "Answer A", "Answer B", "Predicted", "True", "Correct", "Completion"],
+                    data=table_data
+                )
+                wandb.log({"qa/completions": completions_table})
         
         # Save results
         print(f"\nSaving results to {args.output_file}...")

@@ -36,7 +36,7 @@ import requests
 from transformers.modeling_outputs import BaseModelOutput
 from torch import nn
 import json
-from typing import Any, Callable, List
+from typing import Any, Callable, List, Optional
 from peft import LoraConfig, TaskType
 import random
 
@@ -118,6 +118,7 @@ def build_reward_fn(
     tokenizer: AutoTokenizer,
     skip_start_and_end_tokens: bool = True,
     compute_reward_model_scores: bool = True,
+    include_paragraph: bool = True,
 ) -> Callable[[List[str], Any], torch.Tensor]:
     """
     Builds a reward function using the provided dataset.
@@ -137,7 +138,7 @@ def build_reward_fn(
         data_items = [dataset.parse_matching_item(sample) for sample in samples]
         reward_model_prompts_agent = [
             item.build_prompt_for_reward_model(
-                tokenizer, skip_start_and_end_tokens=skip_start_and_end_tokens
+                tokenizer, skip_start_and_end_tokens=skip_start_and_end_tokens, include_paragraph=include_paragraph
             )
             for item in data_items
         ]
@@ -182,7 +183,7 @@ class ServerRewardModel(nn.Module):
     Instead of running a full transformer, it decodes tokens to text and
     sends them to a reward function that queries the external server.
     """
-    def __init__(self, tokenizer, qaCopy, url="http://localhost:8115/reward"):
+    def __init__(self, tokenizer, qaCopy, include_paragraph=True, url="http://localhost:8115/reward"):
         super().__init__()
         self.tokenizer = tokenizer
         self.url = url
@@ -190,7 +191,7 @@ class ServerRewardModel(nn.Module):
         # Required attribute for compatibility with TRL's reward model interface
         self.base_model_prefix = "llama"
         # Build the reward function that will query the external server
-        self.reward_fn = build_reward_fn(qaCopy, tokenizer)
+        self.reward_fn = build_reward_fn(qaCopy, tokenizer, include_paragraph=include_paragraph)
         # Use the dummy backbone to avoid unnecessary computation
         self.llama = ServerRewardBackbone()
         # Dummy parameter to ensure model has at least one trainable parameter
@@ -227,12 +228,13 @@ class QAAccuracyCallback(TrainerCallback):
     Parallelized across all GPUs for efficient evaluation on entire dataset.
     """
     
-    def __init__(self, qa_val_dataset: QADataset, tokenizer, eval_steps: int = 100, callback_freq: int = 20, batch_size: int = 4):
+    def __init__(self, qa_val_dataset: QADataset, tokenizer, eval_steps: int = 100, callback_freq: int = 20, batch_size: int = 4, paragraph_token_limit: Optional[int] = None):
         self.qa_val_dataset = qa_val_dataset
         self.tokenizer = tokenizer
         self.eval_steps = eval_steps
         self.callback_freq = callback_freq  # Run callback every N steps
         self.batch_size = batch_size  # Batch size for inference
+        self.paragraph_token_limit = paragraph_token_limit
         
     def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
         """
@@ -281,7 +283,7 @@ class QAAccuracyCallback(TrainerCallback):
                 batch_items = val_data_chunk[i:i + self.batch_size]
                 
                 # Build prompts for batch
-                prompts = [item.build_prompt_for_agent(self.tokenizer, skip_bos=True) for item in batch_items]
+                prompts = [item.build_prompt_for_agent(self.tokenizer, skip_bos=True, paragraph_token_limit=self.paragraph_token_limit) for item in batch_items]
                 
                 # Tokenize batch
                 inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
@@ -368,7 +370,7 @@ class QAAccuracyCallback(TrainerCallback):
 
 
 if __name__ == "__main__":
-    path_8b = "/nas/ucb/aaryanchandna/code/trl/examples/scripts/ppo/model_checkpoints/SFT/SFT_Llama-3.1-8B_lr1e-6_bs32_maxepoch5_numgpus8_25-04-23_08:48:27/checkpoint-80/checkpoint-80"
+    path_8b = "basebala/llama-3.1-8b-sft-checkpoint-80"
     parser = HfArgumentParser((ScriptArguments, PPOConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_into_dataclasses()
     # remove output_dir if exists
@@ -442,7 +444,7 @@ if __name__ == "__main__":
             num_proc=training_args.dataset_num_proc,
         )
 
-    paragraph_token_limit = 500
+    paragraph_token_limit = 450
     include_paragraph_in_reward_model_prompt = False
 
     train_data_path = "/nas/ucb/aaryanchandna/code/trl/train_qa_le8000.json"
@@ -451,7 +453,7 @@ if __name__ == "__main__":
     qa_val = QADataset(train_data_path=blank_data_path, val_data_path=val_data_path)
     qa = QADataset(train_data_path=train_data_path, val_data_path=val_data_path, include_argument_and_label=False)
     qa_train = QADataset(train_data_path=train_data_path, val_data_path=None)
-    reward_model = ServerRewardModel(tokenizer, qa)
+    reward_model = ServerRewardModel(tokenizer, qa, include_paragraph=include_paragraph_in_reward_model_prompt)
     train_dataset = qa_train.modified_get_hf_dataset("agent", tokenizer=tokenizer, tokenize=True, paragraph_token_limit=paragraph_token_limit, include_paragraph_in_reward_model_prompt=include_paragraph_in_reward_model_prompt)
     eval_dataset = qa_val.modified_get_hf_dataset("agent", tokenizer=tokenizer, tokenize=True, paragraph_token_limit=paragraph_token_limit, include_paragraph_in_reward_model_prompt=include_paragraph_in_reward_model_prompt)
 
@@ -503,7 +505,8 @@ if __name__ == "__main__":
         tokenizer, 
         eval_steps=100, 
         callback_freq=20,
-        batch_size=4  # Batch size per GPU for efficient evaluation
+        batch_size=4,  # Batch size per GPU for efficient evaluation
+        paragraph_token_limit=paragraph_token_limit
     )
     qa_accuracy_callback.trainer = trainer
     trainer.add_callback(qa_accuracy_callback)

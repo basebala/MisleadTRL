@@ -7,7 +7,7 @@
 # Use larger batch_size per GPU for maximum speed (adjust based on GPU memory)
 # ============================================================================
 accelerate launch \
-    --num_processes 4 \
+    --num_processes 1 \
     --num_machines 1 \
     --mixed_precision bf16 \
     --multi_gpu \

@@ -105,21 +105,25 @@ def plot_rewards_and_accuracies(
     if right_accuracy <= 1:
         right_accuracy = right_accuracy * 100
 
-    # Determine axis limits dynamically to better fit the provided ranges
-    reward_min = min(first_reward, last_reward)
-    reward_max = max(first_reward, last_reward)
-    reward_margin = max(0.05, 0.05 * (reward_max - reward_min))
+    # Calculate reward scale so that first_reward appears at 79% and last_reward at 89%
+    # We want: (first_reward - reward_min) / (reward_max - reward_min) = 0.79
+    # And: (last_reward - reward_min) / (reward_max - reward_min) = 0.89
+    # Solving: reward_min = (0.89 * first_reward - 0.79 * last_reward) / (0.89 - 0.79)
+    #          reward_max = reward_min + (last_reward - first_reward) / (0.89 - 0.79)
+    reward_min = (0.89 * first_reward - 0.79 * last_reward) / 0.10
+    reward_max = reward_min + (last_reward - first_reward) / 0.10
+    reward_base = reward_min
 
-    accuracy_min = min(left_accuracy, right_accuracy)
-    accuracy_max = max(left_accuracy, right_accuracy)
-    accuracy_margin = max(2.0, 0.05 * (accuracy_max - accuracy_min))
-    accuracy_base = accuracy_min - accuracy_margin
+    # Fixed accuracy scale: 40 to 75
+    accuracy_min = 40
+    accuracy_max = 75
+    accuracy_base = 40
 
-    # Create figure and axes
+    # Create figure and axes - match plot_reproduction_comparison.py exactly
     fig, ax2 = plt.subplots(figsize=(6, 6))
     ax1 = ax2.twinx()
 
-    # Set width of bars
+    # Set width of bars - match plot_reproduction_comparison.py
     bar_width = 0.3
     offset = 0.5
 
@@ -133,11 +137,8 @@ def plot_rewards_and_accuracies(
     blue_color = (113 / 255, 193 / 255, 209 / 255)  # (113,193,209)
     orange_color = (241 / 255, 180 / 255, 90 / 255)  # (241,180,90)
 
-    # Baseline for reward bars so the small range is visible
-    reward_base = reward_min - reward_margin
-
     # Create bars - reversed from previous version (reward on left, accuracy on right)
-    # Reward bars on the left (ax1)
+    # Reward bars on the left (ax1) - using actual values, scale adjusted so they appear at 79% and 89%
     ax1.bar(
         r1[0],
         first_reward - reward_base,
@@ -145,6 +146,7 @@ def plot_rewards_and_accuracies(
         color=blue_color,
         label="$π_{init}$",
         bottom=reward_base,
+        zorder=1,
     )
     ax1.bar(
         r2[0],
@@ -153,11 +155,12 @@ def plot_rewards_and_accuracies(
         color=orange_color,
         label="$π_{rlhf}$",
         bottom=reward_base,
+        zorder=1,
     )
 
     # Accuracy bars on the right (ax2)
-    ax2.bar(r1[1], left_accuracy - accuracy_base, width=bar_width, color=blue_color, bottom=accuracy_base)
-    ax2.bar(r2[1], right_accuracy - accuracy_base, width=bar_width, color=orange_color, bottom=accuracy_base)
+    ax2.bar(r1[1], left_accuracy - accuracy_base, width=bar_width, color=blue_color, bottom=accuracy_base, zorder=1)
+    ax2.bar(r2[1], right_accuracy - accuracy_base, width=bar_width, color=orange_color, bottom=accuracy_base, zorder=1)
 
     # Add labels and title
     ax1.set_xlabel("Metrics")
@@ -168,30 +171,50 @@ def plot_rewards_and_accuracies(
     ax2.set_xticks([bar_width / 2, offset + 1.5 * bar_width])
     ax2.set_xticklabels(["$R^{train}$", "$R^*$"], fontsize=24)
 
-    # Set axis limits
-    ax1.set_ylim(reward_min - reward_margin, reward_max + reward_margin)
-    ax2.set_ylim(accuracy_min - accuracy_margin, accuracy_max + accuracy_margin)
+    # Set axis limits - fixed scales (match plot_reproduction_comparison.py)
+    ax1.set_ylim(reward_min, reward_max)
+    ax2.set_ylim(accuracy_min, accuracy_max)
+    
+    # Don't set x-limits explicitly - let matplotlib handle it like plot_reproduction_comparison.py
+    # This ensures natural spacing that matches
+    
+    # Get x-limits after matplotlib sets them naturally, then extend slightly for the line
+    # Force a draw to get the actual limits
+    fig.canvas.draw()
+    x_min, x_max = ax2.get_xlim()
+    # Extend slightly for the line to span both sections
+    x_max_extended = x_max + 0.05
+    
+    # Add red dotted line at 50% accuracy labeled "random" - spans full width, drawn on top after everything
+    # Draw on ax2 (accuracy axis) with high zorder
+    line = ax2.plot([x_min, x_max], [50, 50], color='red', linestyle='--', linewidth=1.5, label='random', zorder=10)
+    # Bring ax2 to front so line appears above ax1 bars
+    ax2.set_zorder(ax1.get_zorder() + 1)
+    ax2.patch.set_visible(False)  # Make ax2 background transparent so ax1 shows through
+    
 
-    # Add legend
-    ax1.legend(loc="upper right")
+    # Add legends at the top - make them smaller
+    ax1.legend(loc="upper left", bbox_to_anchor=(0, 1), fontsize=12)
+    # Make the random line in legend smaller by using shorter handlelength and smaller font
+    ax2.legend(loc="upper right", bbox_to_anchor=(1, 1), handlelength=1.5, fontsize=12)
 
     # Adjust layout
     fig.tight_layout()
 
     # Save plot
-    plt.savefig("accuracy_comparison.png", dpi=300)
+    plt.savefig("ablation_comparison.png", dpi=300)
 
 
 if __name__ == "__main__":
     # Same run as plotter.py for rewards
-    REWARD_RUN_NAME = "chandna-uc-berkeley-electrical-engineering-computer-sciences/huggingface/xk976apx"
+    REWARD_RUN_NAME = "chandna-uc-berkeley-electrical-engineering-computer-sciences/huggingface/e40psuhy"
     
     # Two runs for accuracies
     LEFT_ACCURACY_RUN_NAME = (
-        "chandna-uc-berkeley-electrical-engineering-computer-sciences/huggingface/ygyekzne"
+        "chandna-uc-berkeley-electrical-engineering-computer-sciences/huggingface/7odvpk71"
     )
     RIGHT_ACCURACY_RUN_NAME = (
-        "chandna-uc-berkeley-electrical-engineering-computer-sciences/huggingface/9rl3khng"
+        "chandna-uc-berkeley-electrical-engineering-computer-sciences/huggingface/4uhvu93d"
     )
 
     # Get rewards from the reward run (first and last)
