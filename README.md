@@ -55,6 +55,8 @@ python -c "from accelerate import Accelerator; print('Accelerate: OK')"
 
 ## Starting the Reward Model Server
 
+The reward model server is part of the [MisleadLM](https://github.com/luk-s/MisleadLM) repository, which is a fork from the original paper "Language Models Learn to Mislead Humans via RLHF".
+
 **Option 1: Use Pre-trained Reward Model (Recommended)**
 
 You can use a pre-trained reward model from Hugging Face instead of training your own. The reward model checkpoint is available at: [basebala/reward-model-checkpoint-qa](https://huggingface.co/basebala/reward-model-checkpoint-qa)
